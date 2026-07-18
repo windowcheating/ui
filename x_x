@@ -1,0 +1,1136 @@
+--// SERVICES
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local HttpService = game:GetService("HttpService")
+local TextService = game:GetService("TextService")
+local CoreGui = game:GetService("CoreGui")
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+--// SETTINGS
+local teleportOffset = CFrame.new(0, 0, -8)
+local delay = 0.2
+local key = Enum.KeyCode.R
+
+--// SILENT AIM STATE
+local bulletTPEnabled = false
+local targetPlayer = nil
+local lockedTarget = nil
+local isSpectating = false
+local lockedTargetUserId = nil
+local targetDied = false
+
+--// BRING STATE
+local currentBringPlayer = nil
+local detachedParts = {}
+
+--// 3D TARGET CIRCLE STATE
+local circleLines = {}
+local circleData = {[11] = 0}
+local oldRadius = 0
+local rendering = false
+
+-- COLORS
+local CIRCLE_COLOR = Color3.fromRGB(255, 184, 243)
+local CIRCLE_GRADIENT = Color3.fromRGB(255, 255, 255)
+
+--// ESP STATE
+local espLabels = {}
+
+--// CREATE 3D CIRCLE LINES
+for i = 1, 32 do
+    local l = Drawing.new("Line")
+    l.Thickness = 2
+    l.Visible = false
+    circleLines[i] = l
+end
+
+--// TWEEN RADIUS
+local function tweenRadius(target)
+    circleData[11] = circleData[11] + (target - circleData[11]) * 0.25
+end
+
+--// GET CLOSEST PLAYER
+local function getClosestPlayer()
+    local closest, dist = nil, math.huge
+    local mouse = LocalPlayer:GetMouse()
+    
+    for _, v in ipairs(Players:GetPlayers()) do
+        if v ~= LocalPlayer and v.Character and v.Character:FindFirstChild("HumanoidRootPart") then
+            local pos, onScreen = Camera:WorldToViewportPoint(v.Character.HumanoidRootPart.Position)
+            if onScreen then
+                local mag = (Vector2.new(pos.X, pos.Y) - Vector2.new(mouse.X, mouse.Y)).Magnitude
+                if mag < dist then
+                    dist = mag
+                    closest = v
+                end
+            end
+        end
+    end
+    return closest
+end
+
+--// GET PLAYER BY USER ID
+local function getPlayerByUserId(userId)
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.UserId == userId then
+            return player
+        end
+    end
+    return nil
+end
+
+--// GET TARGET PART - WITH FALLBACKS
+local function getTargetPart()
+    if not lockedTarget then return nil end
+    
+    local target = lockedTarget
+    if not target or not target.Parent then
+        if lockedTargetUserId then
+            target = getPlayerByUserId(lockedTargetUserId)
+            if target then
+                lockedTarget = target
+                targetPlayer = target
+            else
+                return nil
+            end
+        else
+            return nil
+        end
+    end
+    
+    if not target.Character or not target.Character.Parent then
+        return nil
+    end
+    
+    local handData = detachedParts[target]
+    if handData and handData.Part and handData.Part.Parent then
+        return handData.Part
+    end
+    
+    local head = target.Character:FindFirstChild("Head")
+    if head and head.Parent then
+        return head
+    end
+    
+    local torso = target.Character:FindFirstChild("UpperTorso")
+    if torso and torso.Parent then
+        return torso
+    end
+    
+    local hrp = target.Character:FindFirstChild("HumanoidRootPart")
+    if hrp and hrp.Parent then
+        return hrp
+    end
+    
+    return nil
+end
+
+--// INVISIBLE TRACERS
+local function handleTracer(obj)
+    if not bulletTPEnabled then return end
+    local n = obj.Name:lower()
+    if n:find("tracer") or n:find("bullet") or n:find("beam") or obj:IsA("Trail") or obj:IsA("Beam") then
+        task.spawn(function()
+            while bulletTPEnabled and obj and obj.Parent do
+                if obj:IsA("BasePart") then 
+                    obj.Transparency = 1
+                    obj.LocalTransparencyModifier = 1
+                elseif obj:IsA("Trail") or obj:IsA("Beam") then 
+                    obj.Enabled = false 
+                end
+                task.wait()
+            end
+        end)
+    end
+end
+
+workspace.DescendantAdded:Connect(handleTracer)
+
+task.spawn(function()
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        handleTracer(obj)
+    end
+end)
+
+--// DETACH LEFT HAND
+local function detachLeftHand(player)
+    local character = player.Character
+    if not character then return end
+    
+    local leftHand = character:FindFirstChild("LeftHand") or 
+                     character:FindFirstChild("Left Arm") or
+                     character:FindFirstChild("LeftArm")
+    
+    if not leftHand then return end
+    if detachedParts[player] then return end
+    
+    local originalParent = leftHand.Parent
+    local originalCFrame = leftHand.CFrame
+    
+    local torso = character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso")
+    local relativeCFrame = nil
+    if torso then
+        relativeCFrame = torso.CFrame:ToObjectSpace(originalCFrame)
+    end
+    
+    local weldsToRemove = {}
+    for _, weld in ipairs(character:GetDescendants()) do
+        if weld:IsA("Weld") or weld:IsA("Motor6D") then
+            if weld.Part0 == leftHand or weld.Part1 == leftHand then
+                table.insert(weldsToRemove, weld)
+            end
+        end
+    end
+    
+    for _, weld in ipairs(weldsToRemove) do
+        weld:Destroy()
+    end
+    
+    leftHand.LocalTransparencyModifier = 1
+    leftHand.Transparency = 1
+    
+    leftHand.Parent = workspace
+    leftHand.CFrame = originalCFrame
+    
+    detachedParts[player] = {
+        Part = leftHand,
+        OriginalParent = originalParent,
+        OriginalCFrame = originalCFrame,
+        RelativeCFrame = relativeCFrame,
+        Torso = torso
+    }
+end
+
+--// REATTACH LEFT HAND
+local function reattachLeftHand(player)
+    if not detachedParts[player] then return end
+    
+    local data = detachedParts[player]
+    local part = data.Part
+    local originalParent = data.OriginalParent
+    local originalCFrame = data.OriginalCFrame
+    local relativeCFrame = data.RelativeCFrame
+    local torso = data.Torso or originalParent:FindFirstChild("UpperTorso") or originalParent:FindFirstChild("Torso")
+    
+    if part and originalParent then
+        if torso and relativeCFrame then
+            part.CFrame = torso.CFrame * relativeCFrame
+        elseif originalCFrame then
+            part.CFrame = originalCFrame
+        end
+        
+        part.LocalTransparencyModifier = 0
+        part.Transparency = 0
+        
+        part.Parent = originalParent
+        
+        local leftShoulder = originalParent:FindFirstChild("LeftShoulder") or 
+                             originalParent:FindFirstChild("Left Arm") or
+                             originalParent:FindFirstChild("LeftArm")
+        
+        if leftShoulder and leftShoulder:IsA("Motor6D") then
+            leftShoulder.Part0 = torso or originalParent:FindFirstChild("UpperTorso") or originalParent:FindFirstChild("Torso")
+            leftShoulder.Part1 = part
+        else
+            local newWeld = Instance.new("Weld")
+            local torsoPart = torso or originalParent:FindFirstChild("UpperTorso") or originalParent:FindFirstChild("Torso")
+            newWeld.Part0 = torsoPart
+            newWeld.Part1 = part
+            if torsoPart then
+                newWeld.C0 = torsoPart.CFrame:Inverse() * part.CFrame
+                newWeld.Parent = part
+            end
+        end
+    end
+    
+    detachedParts[player] = nil
+end
+
+--// SILENT AIM FUNCTIONS
+local function pressReload()
+    VirtualInputManager:SendKeyEvent(true, key, false, game)
+    task.wait(0.05)
+    VirtualInputManager:SendKeyEvent(false, key, false, game)
+end
+
+local function getTool()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    for _, v in ipairs(char:GetChildren()) do
+        if v:IsA("Tool") then
+            return v
+        end
+    end
+    return nil
+end
+
+task.spawn(function()
+    while true do
+        local t = getTool()
+        if t then
+            local ammo = t:FindFirstChild("Ammo", true)
+            if ammo and ammo:IsA("ValueBase") then
+                if ammo.Value <= 0 then
+                    local r = t:FindFirstChild("Reload", true) or t:FindFirstChild("ReloadFunction", true)
+                    if r then
+                        pcall(function()
+                            r:FireServer()
+                        end)
+                    else
+                        pressReload()
+                    end
+                    task.wait(0.8)
+                end
+            end
+        end
+        task.wait(delay)
+    end
+end)
+
+local function stopSpectate()
+    isSpectating = false
+    if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Humanoid") then
+        Camera.CameraSubject = LocalPlayer.Character.Humanoid
+    else
+        -- Fallback: try to find any valid subject
+        local char = LocalPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                Camera.CameraSubject = hum
+            end
+        end
+    end
+end
+
+--// STARLIGHT AURA SYSTEM
+local particleAura = game:GetObjects("rbxassetid://134645216613107")[1]
+local activeParticles = {}
+local auraTarget = nil
+
+local function applyColor(obj)
+    local colorSeq = ColorSequence.new(CIRCLE_COLOR)
+
+    for _, v in ipairs(obj:GetDescendants()) do
+        if v:IsA("ParticleEmitter") or v:IsA("Beam") or v:IsA("Trail") then
+            v.Color = colorSeq
+        elseif v:IsA("PointLight") then
+            v.Color = CIRCLE_COLOR
+        end
+    end
+end
+
+local function clearAura()
+    for _, v in ipairs(activeParticles) do
+        if v then
+            v:Destroy()
+        end
+    end
+    activeParticles = {}
+    auraTarget = nil
+end
+
+local function applyAura(character)
+    if not character then return end
+    
+    if lockedTarget and lockedTarget.Character ~= character then
+        return
+    end
+    
+    clearAura()
+    auraTarget = character
+
+    local clone = particleAura:Clone()
+    applyColor(clone)
+
+    for _, part in ipairs(clone:GetChildren()) do
+        local target = character:FindFirstChild(part.Name)
+
+        if target then
+            for _, obj in ipairs(part:GetChildren()) do
+                obj.Name = "\0"
+                obj.Parent = target
+                table.insert(activeParticles, obj)
+            end
+        end
+    end
+
+    clone:Destroy()
+end
+
+--// LOCK TARGET FUNCTION
+local function lockTarget(player)
+    if not player then return end
+    
+    lockedTarget = player
+    targetPlayer = player
+    bulletTPEnabled = true
+    lockedTargetUserId = player.UserId
+    targetDied = false
+    
+    if not currentBringPlayer or currentBringPlayer ~= player then
+        if currentBringPlayer then
+            reattachLeftHand(currentBringPlayer)
+        end
+        detachLeftHand(player)
+        currentBringPlayer = player
+    end
+    
+    if player.Character then
+        applyAura(player.Character)
+    end
+    
+    container.Visible = true
+    container.BackgroundTransparency = 0
+    container.ImageTransparency = 0
+    for _, child in ipairs(container:GetDescendants()) do
+        if child:IsA("Frame") or child:IsA("ImageLabel") or child:IsA("TextLabel") then
+            pcall(function()
+                child.BackgroundTransparency = 0
+                child.ImageTransparency = 0
+                child.TextTransparency = 0
+            end)
+        end
+    end
+end
+
+--// UNLOCK TARGET FUNCTION
+local function unlockTarget()
+    lockedTarget = nil
+    targetPlayer = nil
+    bulletTPEnabled = false
+    lockedTargetUserId = nil
+    targetDied = false
+    stopSpectate()
+    
+    if currentBringPlayer then
+        reattachLeftHand(currentBringPlayer)
+        currentBringPlayer = nil
+    end
+    
+    for i = 1, 32 do
+        circleLines[i].Visible = false
+    end
+    rendering = false
+    
+    clearAura()
+    
+    container.Visible = false
+end
+
+--// ATLANTA STYLE HUD
+-- Pink Theme
+local themes = {
+    outline = Color3.fromRGB(20, 20, 20),
+    inline = Color3.fromRGB(45, 45, 45),
+    accent = Color3.fromRGB(255, 184, 243),
+    high_contrast = Color3.fromRGB(30, 30, 30),
+    low_contrast = Color3.fromRGB(40, 40, 40),
+    text = Color3.fromRGB(255, 255, 255),
+    text_outline = Color3.fromRGB(0, 0, 0),
+    glow = Color3.fromRGB(255, 184, 243),
+    health_green = Color3.fromRGB(0, 255, 133),
+    armor_blue = Color3.fromRGB(255, 184, 243),
+    alive_hex = "#FFB8F3",
+    down_hex = "#FF3232"
+}
+
+local function create(class, props)
+    local ins = Instance.new(class)
+    for k, v in next, props do ins[k] = v end
+    if class:find("Text") then
+        if not props.Font then ins.Font = Enum.Font.SourceSans end
+        if not props.Text then ins.Text = "" end 
+    end
+    return ins
+end
+
+-- ScreenGui
+local screenGui = create("ScreenGui", {
+    Name = "TargetHUD",
+    Parent = CoreGui,
+    ResetOnSpawn = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Global
+})
+
+-- Main Container (Middle Left)
+local container = create("Frame", {
+    Parent = screenGui,
+    Size = UDim2.new(0, 280, 0, 200),
+    Position = UDim2.new(0, 20, 0.5, -100),
+    BackgroundTransparency = 1,
+    Visible = false
+})
+
+-- Static Glow
+local glow = create("ImageLabel", {
+    Parent = container,
+    Name = "glow",
+    ImageColor3 = themes.glow,
+    ScaleType = Enum.ScaleType.Slice,
+    Image = "http://www.roblox.com/asset/?id=18245826428",
+    BackgroundTransparency = 1,
+    ImageTransparency = 0.7,
+    Position = UDim2.new(0, -18, 0, -18),
+    Size = UDim2.new(1, 36, 1, 36),
+    ZIndex = 0,
+    BorderSizePixel = 0,
+    SliceCenter = Rect.new(21, 21, 79, 79)
+})
+
+-- Outer Window
+local window = create("Frame", {
+    Parent = container,
+    Size = UDim2.new(1, 0, 1, 0),
+    BackgroundColor3 = themes.outline,
+    BorderSizePixel = 0,
+    ZIndex = 1
+})
+
+-- Structure
+local mainAccent = create("Frame", {
+    Parent = window,
+    Size = UDim2.new(1, -2, 1, -2),
+    Position = UDim2.new(0, 1, 0, 1),
+    BackgroundColor3 = themes.accent,
+    BorderSizePixel = 0
+})
+local mainBg = create("Frame", {
+    Parent = mainAccent,
+    Size = UDim2.new(1, -2, 1, -2),
+    Position = UDim2.new(0, 1, 0, 1),
+    BackgroundColor3 = themes.high_contrast,
+    BorderSizePixel = 0
+})
+
+local title = create("TextLabel", {
+    Parent = mainBg,
+    Text = "Target Info",
+    Size = UDim2.new(1, 0, 0, 18),
+    Position = UDim2.new(0, 6, 0, 2),
+    BackgroundTransparency = 1,
+    TextColor3 = themes.text,
+    TextSize = 13,
+    TextXAlignment = Enum.TextXAlignment.Left
+})
+create("UIStroke", {Parent = title, Color = themes.text_outline})
+
+-- Inner Content Box
+local innerOutline = create("Frame", {
+    Parent = mainBg,
+    Size = UDim2.new(1, -8, 1, -28),
+    Position = UDim2.new(0, 4, 0, 22),
+    BackgroundColor3 = themes.outline,
+    BorderSizePixel = 0
+})
+local innerInline = create("Frame", {
+    Parent = innerOutline,
+    Size = UDim2.new(1, -2, 1, -2),
+    Position = UDim2.new(0, 1, 0, 1),
+    BackgroundColor3 = themes.inline,
+    BorderSizePixel = 0
+})
+local content = create("Frame", {
+    Parent = innerInline,
+    Size = UDim2.new(1, -2, 1, -2),
+    Position = UDim2.new(0, 1, 0, 1),
+    BackgroundColor3 = themes.low_contrast,
+    BorderSizePixel = 0
+})
+
+local infoHeader = create("TextLabel", {
+    Parent = content,
+    Text = "Player Stats",
+    Size = UDim2.new(1, 0, 0, 14),
+    Position = UDim2.new(0, 6, 0, 3),
+    BackgroundTransparency = 1,
+    TextColor3 = themes.text,
+    TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left
+})
+create("UIStroke", {Parent = infoHeader, Color = themes.text_outline})
+
+local infoLine = create("Frame", {
+    Parent = content,
+    Size = UDim2.new(1, 0, 0, 1),
+    Position = UDim2.new(0, 0, 0, 18),
+    BackgroundColor3 = themes.accent,
+    BorderSizePixel = 0
+})
+
+-- Avatar Section
+local pfpOutline = create("Frame", {
+    Parent = content,
+    Size = UDim2.new(0, 50, 0, 50),
+    Position = UDim2.new(0, 8, 0, 26),
+    BackgroundColor3 = themes.outline,
+    BorderSizePixel = 0
+})
+local pfp = create("ImageLabel", {
+    Parent = pfpOutline,
+    Size = UDim2.new(1, -2, 1, -2),
+    Position = UDim2.new(0, 1, 0, 1),
+    BackgroundColor3 = themes.low_contrast,
+    BorderSizePixel = 0
+})
+
+-- Labels
+local function createStat(pos)
+    local l = create("TextLabel", {
+        Parent = content,
+        Size = UDim2.new(1, -80, 0, 14),
+        Position = pos,
+        BackgroundTransparency = 1,
+        TextColor3 = themes.text,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        RichText = true
+    })
+    create("UIStroke", {Parent = l, Color = themes.text_outline})
+    return l
+end
+
+local nameLbl = createStat(UDim2.new(0, 66, 0, 26))
+local toolLbl = createStat(UDim2.new(0, 66, 0, 38))
+local lockLbl = createStat(UDim2.new(0, 66, 0, 50))
+local distLbl = createStat(UDim2.new(0, 66, 0, 62))
+local posLbl = createStat(UDim2.new(0, 66, 0, 74))
+
+-- Bars
+local function createBar(pos, labelText, barColor)
+    local label = createStat(pos)
+    label.Text = labelText
+    local bg = create("Frame", {
+        Parent = content,
+        Size = UDim2.new(1, -16, 0, 12),
+        Position = pos + UDim2.new(0, 0, 0, 15),
+        BackgroundColor3 = themes.outline,
+        BorderSizePixel = 0
+    })
+    local fill = create("Frame", {
+        Parent = bg,
+        Size = UDim2.new(0, 0, 1, -2),
+        Position = UDim2.new(0, 1, 0, 1),
+        BackgroundColor3 = barColor,
+        BorderSizePixel = 0
+    })
+    create("UIGradient", {
+        Parent = fill,
+        Rotation = 90,
+        Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(200, 200, 200))
+    })
+    local valText = create("TextLabel", {
+        Parent = bg,
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        TextColor3 = Color3.new(1, 1, 1),
+        TextSize = 10,
+        ZIndex = 5
+    })
+    create("UIStroke", {Parent = valText, Color = Color3.new(0, 0, 0)})
+    return label, fill, valText
+end
+
+local _, hpFill, hpValText = createBar(UDim2.new(0, 8, 0, 94), "Health", themes.health_green)
+local _, armorFill, armorValText = createBar(UDim2.new(0, 8, 0, 130), "Armor", themes.armor_blue)
+
+--// HUD UPDATE
+local function updateHUD()
+    if not lockedTarget or not lockedTarget.Character then
+        container.Visible = false
+        return
+    end
+    
+    local char = lockedTarget.Character
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local foot = char:FindFirstChild("Right Leg") or char:FindFirstChild("RightFoot") or hrp
+    
+    if not hum or not hrp or not foot then
+        container.Visible = false
+        return
+    end
+    
+    nameLbl.Text = "Player: " .. lockedTarget.Name
+    toolLbl.Text = "Tool: " .. (char:FindFirstChildOfClass("Tool") and char:FindFirstChildOfClass("Tool").Name or "None")
+    
+    local bodyEffects = char:FindFirstChild("BodyEffects")
+    local isKO = (bodyEffects and (bodyEffects:FindFirstChild("K.O") or bodyEffects:FindFirstChild("KO")))
+    if (isKO and isKO.Value == true) or hum.Health <= 0.1 then
+        lockLbl.Text = "Status: <font color=\"" .. themes.down_hex .. "\">Down</font>"
+    else
+        lockLbl.Text = "Status: <font color=\"" .. themes.alive_hex .. "\">Alive</font>"
+    end
+    
+    local myChar = LocalPlayer.Character
+    if myChar and myChar:FindFirstChild("HumanoidRootPart") then
+        distLbl.Text = "Distance: " .. math.floor((hrp.Position - myChar.HumanoidRootPart.Position).Magnitude) .. " studs"
+    else
+        distLbl.Text = "Distance: N/A"
+    end
+    posLbl.Text = string.format("Pos: X:%.1f Y:%.1f Z:%.1f", hrp.Position.X, hrp.Position.Y, hrp.Position.Z)
+    
+    hpFill.Size = UDim2.new(math.clamp(hum.Health / hum.MaxHealth, 0, 1), -2, 1, -2)
+    hpValText.Text = math.floor(hum.Health) .. "/" .. math.floor(hum.MaxHealth)
+    
+    local armorObj = (bodyEffects and bodyEffects:FindFirstChild("Armor")) or char:FindFirstChild("Armor")
+    local armorAmt = (armorObj and armorObj.Value) or 0
+    local maxArmor = (armorObj and (armorObj:FindFirstChild("MaxArmor") or armorObj:FindFirstChild("Max"))) and (armorObj:FindFirstChild("MaxArmor") or armorObj:FindFirstChild("Max")).Value or 100
+    armorFill.Size = UDim2.new(math.clamp(armorAmt / maxArmor, 0, 1), -2, 1, -2)
+    armorValText.Text = math.floor(armorAmt) .. "/" .. math.floor(maxArmor)
+    
+    pfp.Image = "rbxthumb://type=AvatarHeadShot&id=" .. lockedTarget.UserId .. "&w=150&h=150"
+    
+    container.Visible = true
+end
+
+--// WATERMARK - TOP MIDDLE PINK THEME
+local watermarkGui = Instance.new("ScreenGui")
+watermarkGui.Name = "Watermark"
+watermarkGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+watermarkGui.Parent = CoreGui
+
+local watermarkFrame = Instance.new("Frame")
+watermarkFrame.AnchorPoint = Vector2.new(0.5, 0)
+watermarkFrame.BackgroundTransparency = 1
+watermarkFrame.Position = UDim2.new(0.5, 0, 0, 10)
+watermarkFrame.Size = UDim2.new(0, 300, 0, 30)
+watermarkFrame.Parent = watermarkGui
+
+local wmFrame1 = Instance.new("Frame")
+wmFrame1.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+wmFrame1.BorderSizePixel = 0
+wmFrame1.Size = UDim2.new(1, -1, 1, 0)
+wmFrame1.Parent = watermarkFrame
+
+local wmFrame2 = Instance.new("Frame")
+wmFrame2.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+wmFrame2.BorderSizePixel = 0
+wmFrame2.Position = UDim2.new(0, 1, 0, 1)
+wmFrame2.Size = UDim2.new(1, -2, 1, -2)
+wmFrame2.Parent = wmFrame1
+
+local wmFrame3 = Instance.new("Frame")
+wmFrame3.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+wmFrame3.BorderSizePixel = 0
+wmFrame3.Position = UDim2.new(0, 1, 0, 1)
+wmFrame3.Size = UDim2.new(1, -2, 1, -2)
+wmFrame3.Parent = wmFrame2
+
+local wmGradient = Instance.new("UIGradient")
+wmGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(30, 30, 30)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(20, 20, 20))
+})
+wmGradient.Parent = wmFrame3
+
+local wmBar = Instance.new("Frame")
+wmBar.BackgroundColor3 = Color3.fromRGB(255, 184, 243)
+wmBar.BorderSizePixel = 0
+wmBar.Size = UDim2.new(1, 0, 0, 2)
+wmBar.Name = "bar"
+wmBar.Parent = wmFrame3
+
+local wmBarGradient = Instance.new("UIGradient")
+wmBarGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 184, 243)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(200, 150, 200))
+})
+wmBarGradient.Parent = wmBar
+
+local wmInfo = Instance.new("Frame")
+wmInfo.AnchorPoint = Vector2.new(0.5, 0.5)
+wmInfo.BackgroundTransparency = 1
+wmInfo.Position = UDim2.new(0.5, 0, 0.5, 0)
+wmInfo.Size = UDim2.new(1, 0, 0, 15)
+wmInfo.Name = "info"
+wmInfo.Parent = wmFrame3
+
+local wmText = Instance.new("TextLabel")
+wmText.Font = Enum.Font.SourceSans
+wmText.Text = ""
+wmText.TextColor3 = Color3.fromRGB(180, 180, 180)
+wmText.TextSize = 12
+wmText.BackgroundTransparency = 1
+wmText.Size = UDim2.new(1, 0, 1, 0)
+wmText.Position = UDim2.new(0.5, 0, 0.5, 0)
+wmText.AnchorPoint = Vector2.new(0.5, 0.5)
+wmText.Parent = wmInfo
+
+local function getFormattedTime()
+    local t = os.date("*t")
+    return string.format("%s %02d %04d - %02d:%02d:%02d",
+        os.date("%B", os.time()),
+        t.day,
+        t.year,
+        t.hour,
+        t.min,
+        t.sec
+    )
+end
+
+local function parseText(text)
+    text = text:gsub("%[time%]", getFormattedTime())
+    text = text:gsub("%[name%]", LocalPlayer.Name)
+    text = text:gsub("%[display%]", LocalPlayer.DisplayName)
+    return text
+end
+
+-- Update watermark
+RunService.Heartbeat:Connect(function()
+    wmBarGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 184, 243)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(200, 150, 200))
+    })
+    
+    local newText = "x_x - @whywhywhylolol - private - [name] - [time]"
+    wmText.Text = parseText(newText)
+    
+    local size = TextService:GetTextSize(wmText.Text, wmText.TextSize, wmText.Font, Vector2.new(math.huge, math.huge))
+    watermarkFrame.Size = UDim2.new(0, size.X + 20, watermarkFrame.Size.Y.Scale, watermarkFrame.Size.Y.Offset)
+end)
+
+--// ESP FUNCTIONS
+local function addESP(player)
+    if player == LocalPlayer then return end
+    
+    if espLabels[player.UserId] then
+        espLabels[player.UserId]:Remove()
+        espLabels[player.UserId] = nil
+    end
+    
+    local label = Drawing.new("Text")
+    label.Size = 14
+    label.Center = true
+    label.Outline = true
+    label.OutlineColor = Color3.fromRGB(0, 0, 0)
+    label.Color = Color3.fromRGB(255, 255, 255)
+    label.Font = Drawing.Fonts.Plex
+    label.Visible = false
+    label.ZIndex = 1000
+    
+    espLabels[player.UserId] = label
+end
+
+local function removeESP(player)
+    local label = espLabels[player.UserId]
+    if label then
+        label:Remove()
+        espLabels[player.UserId] = nil
+    end
+end
+
+local function refreshESP()
+    for userId, label in pairs(espLabels) do
+        local player = Players:GetPlayerByUserId(userId)
+        if not player or not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") then
+            label.Visible = false
+            continue
+        end
+        
+        local hrp = player.Character.HumanoidRootPart
+        local head = player.Character:FindFirstChild("Head")
+        
+        if not hrp or not head then
+            label.Visible = false
+            continue
+        end
+        
+        local hum = player.Character:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then
+            label.Visible = false
+            continue
+        end
+        
+        local worldPos = head.Position + Vector3.new(0, 2.5, 0)
+        local screenPos, onScreen = Camera:WorldToViewportPoint(worldPos)
+        
+        if onScreen and screenPos.Z > 0 then
+            label.Position = Vector2.new(screenPos.X, screenPos.Y)
+            label.Text = player.DisplayName or player.Name
+            
+            if lockedTarget and lockedTarget.UserId == userId then
+                label.Color = Color3.fromRGB(255, 184, 243)
+            else
+                label.Color = Color3.fromRGB(255, 255, 255)
+            end
+            
+            label.Visible = true
+        else
+            label.Visible = false
+        end
+    end
+end
+
+--// SILENT AIM - FIXED WITH PROPER TARGET RETRIEVAL AND SPECTATE HANDLING
+local mouse = LocalPlayer:GetMouse()
+local mt = getrawmetatable(game)
+local oldIndex = mt.__index
+
+setreadonly(mt, false)
+
+mt.__index = function(self, key)
+    if not checkcaller() and self == mouse and key == "Hit" and bulletTPEnabled then
+        -- If spectating, temporarily switch camera back to local player for aiming
+        local originalSubject = nil
+        if isSpectating then
+            originalSubject = Camera.CameraSubject
+            if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Humanoid") then
+                Camera.CameraSubject = LocalPlayer.Character.Humanoid
+            end
+        end
+        
+        local targetPart = getTargetPart()
+        local result = nil
+        
+        if targetPart and targetPart.Parent then
+            result = CFrame.new(targetPart.Position)
+        end
+        
+        if not result and lockedTargetUserId then
+            local player = getPlayerByUserId(lockedTargetUserId)
+            if player and player.Character and player.Character.Parent then
+                lockedTarget = player
+                targetPlayer = player
+                
+                local part = getTargetPart()
+                if part and part.Parent then
+                    result = CFrame.new(part.Position)
+                end
+            end
+        end
+        
+        -- Restore spectate camera if it was changed
+        if isSpectating and originalSubject then
+            Camera.CameraSubject = originalSubject
+        end
+        
+        if result then
+            return result
+        end
+    end
+    return oldIndex(self, key)
+end
+
+setreadonly(mt, true)
+
+--// KEYBINDS - UPDATED WITH SPECTATE FIX
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    
+    if input.KeyCode == Enum.KeyCode.C then
+        if lockedTarget then
+            unlockTarget()
+        else
+            local t = getClosestPlayer()
+            if t then
+                lockTarget(t)
+            end
+        end
+    end
+    
+    if input.KeyCode == Enum.KeyCode.Z then
+        if lockedTarget then
+            isSpectating = not isSpectating
+            if isSpectating then
+                if lockedTarget.Character and lockedTarget.Character:FindFirstChild("Humanoid") then
+                    Camera.CameraSubject = lockedTarget.Character.Humanoid
+                end
+            else
+                stopSpectate()
+            end
+        end
+    end
+end)
+
+--// HANDLE PLAYER RESPAWN
+local function onCharacterAdded(player)
+    if lockedTargetUserId and player.UserId == lockedTargetUserId then
+        task.wait(0.3)
+        
+        if player.Character then
+            lockedTarget = player
+            targetPlayer = player
+            bulletTPEnabled = true
+            targetDied = false
+            
+            if currentBringPlayer then
+                reattachLeftHand(currentBringPlayer)
+            end
+            detachLeftHand(player)
+            currentBringPlayer = player
+            
+            applyAura(player.Character)
+        end
+    end
+    
+    if currentBringPlayer == player then
+        task.wait(0.1)
+        detachLeftHand(player)
+    end
+    
+    if lockedTarget == player and player.Character then
+        task.wait(0.2)
+        applyAura(player.Character)
+    end
+    
+    if player ~= LocalPlayer then
+        addESP(player)
+    end
+end
+
+local function onCharacterRemoving(player)
+    if lockedTarget and lockedTarget.UserId == player.UserId then
+        targetDied = true
+        bulletTPEnabled = false
+        clearAura()
+    end
+end
+
+-- Initialize
+for _, player in ipairs(Players:GetPlayers()) do
+    if player ~= LocalPlayer then
+        addESP(player)
+        
+        player.CharacterAdded:Connect(function()
+            onCharacterAdded(player)
+        end)
+        
+        player.CharacterRemoving:Connect(function()
+            onCharacterRemoving(player)
+        end)
+    end
+end
+
+Players.PlayerAdded:Connect(function(player)
+    if player ~= LocalPlayer then
+        addESP(player)
+    end
+    
+    player.CharacterAdded:Connect(function()
+        onCharacterAdded(player)
+    end)
+    
+    player.CharacterRemoving:Connect(function()
+        onCharacterRemoving(player)
+    end)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+    if currentBringPlayer == player then
+        detachedParts[player] = nil
+        currentBringPlayer = nil
+    end
+    if lockedTarget == player then
+        unlockTarget()
+    end
+    removeESP(player)
+end)
+
+--// MAIN LOOP
+RunService.RenderStepped:Connect(function(dt)
+    -- Bring the left hand
+    if currentBringPlayer and not isSpectating then
+        local myChar = LocalPlayer.Character
+        if myChar and myChar:FindFirstChild("HumanoidRootPart") then
+            local handData = detachedParts[currentBringPlayer]
+            if handData and handData.Part then
+                handData.Part.CFrame = myChar.HumanoidRootPart.CFrame * teleportOffset
+                handData.Part.LocalTransparencyModifier = 1
+                handData.Part.Transparency = 1
+            else
+                detachLeftHand(currentBringPlayer)
+            end
+        end
+    end
+    
+    -- Update spectate
+    if isSpectating and lockedTarget then
+        if lockedTarget.Character and lockedTarget.Character:FindFirstChild("Humanoid") then
+            Camera.CameraSubject = lockedTarget.Character.Humanoid
+        end
+    end
+    
+    -- 3D TARGET CIRCLE RENDERING
+    if lockedTarget and lockedTarget.Character and lockedTarget.Character:FindFirstChild("UpperTorso") then
+        local char = lockedTarget.Character
+        local torso = char.UpperTorso
+        
+        rendering = true
+        local position = torso.Position
+        
+        local size = char:GetExtentsSize()
+        local newRadius = math.clamp((size.X + size.Z) / 3, 2, 10)
+        
+        if math.abs(newRadius - oldRadius) > 1.1 then
+            oldRadius = newRadius
+            circleData[11] = newRadius + 3
+        end
+        
+        tweenRadius(newRadius)
+        local radius = circleData[11]
+        local offset = (tick() * 4) % (math.pi * 2)
+        
+        for i = 1, 32 do
+            local line = circleLines[i]
+            
+            local angle1 = (math.pi * 2 / 32) * (i - 1) + offset
+            local angle2 = (math.pi * 2 / 32) * i + offset
+            
+            local world1 = position + Vector3.new(math.cos(angle1) * radius, 0, math.sin(angle1) * radius)
+            local world2 = position + Vector3.new(math.cos(angle2) * radius, 0, math.sin(angle2) * radius)
+            
+            local p1, vis1 = Camera:WorldToViewportPoint(world1)
+            local p2, vis2 = Camera:WorldToViewportPoint(world2)
+            
+            if vis1 and vis2 then
+                local fade = i / 32
+                
+                line.From = Vector2.new(p1.X, p1.Y)
+                line.To = Vector2.new(p2.X, p2.Y)
+                line.Transparency = math.max(0, fade)
+                line.Color = CIRCLE_COLOR:Lerp(CIRCLE_GRADIENT, i / 32)
+                line.Visible = true
+            else
+                line.Visible = false
+            end
+        end
+        
+    elseif rendering then
+        oldRadius = 0
+        rendering = false
+        for i = 1, 32 do
+            circleLines[i].Visible = false
+        end
+    end
+    
+    -- Refresh ESP
+    refreshESP()
+    
+    -- Update HUD
+    updateHUD()
+    
+    -- Auto-re-lock if target died and respawned
+    if lockedTargetUserId and targetDied then
+        local player = getPlayerByUserId(lockedTargetUserId)
+        if player and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+            lockTarget(player)
+        end
+    end
+    
+    if lockedTargetUserId and not lockedTarget then
+        local player = getPlayerByUserId(lockedTargetUserId)
+        if player and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+            lockTarget(player)
+        end
+    end
+    
+    if lockedTarget and not lockedTarget.Parent then
+        local userId = lockedTarget.UserId
+        unlockTarget()
+        lockedTargetUserId = userId
+    end
+end)
